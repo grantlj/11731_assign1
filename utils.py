@@ -3,6 +3,20 @@ from typing import List
 
 import numpy as np
 import copy
+import torch
+
+def save_model_by_state_dict(model,model_fn):
+    pass
+    torch.save({'state_dict':model.cpu().state_dict()},model_fn)
+    model=model.cuda()
+    return
+
+#   load model state dict
+def load_model_by_state_dict(model,state_dict_fn):
+    pass
+    model_dict=torch.load(state_dict_fn)
+    model.load_state_dict(model_dict['state_dict'])
+    return model
 
 
 def input_transpose(sents, pad_token):

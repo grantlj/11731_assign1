@@ -5,8 +5,8 @@ A very basic implementation of neural machine translation
 
 Usage:
     nmt.py train --train-src=<file> --train-tgt=<file> --dev-src=<file> --dev-tgt=<file> --vocab=<file> [options]
-    nmt.py decode [options] MODEL_PATH TEST_SOURCE_FILE OUTPUT_FILE
-    nmt.py decode [options] MODEL_PATH TEST_SOURCE_FILE TEST_TARGET_FILE OUTPUT_FILE
+    nmt.py decode --vocab=<file> [options] MODEL_PATH TEST_SOURCE_FILE OUTPUT_FILE
+    nmt.py decode --vocab=<file> [options] MODEL_PATH TEST_SOURCE_FILE TEST_TARGET_FILE OUTPUT_FILE
 
 Options:
     -h --help                               show this screen.
@@ -56,10 +56,13 @@ from torch import Tensor
 from nn_modules import Encoder,AttentionDecoder
 from torch import nn
 from torch.autograd import Variable
+from torch import optim
+from torch.nn.utils import clip_grad_norm
+
 
 Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
-MAX_LEN=50
+MAX_LEN=100
 
 class NMT(object):
 
@@ -83,7 +86,7 @@ class NMT(object):
                                           output_size=len(self.vocab.tgt),
                                           hidden_size=hidden_size,dropout=dropout_rate,batch_first=True,MAX_LEN=MAX_LEN).cuda()
 
-    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> Tensor:
+    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]],keep_grad=True) -> Tensor:
         """
         take a mini-batch of source and target sentences, compute the log-likelihood of 
         target sentences.
@@ -102,12 +105,19 @@ class NMT(object):
         src_sents_padded=utils.input_transpose_max_len(src_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
         tgt_sents_padded=utils.input_transpose_max_len(tgt_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
 
-        src_encodings, decoder_init_state = self.encode(src_sents_padded)
-        scores,loss = self.decode(src_encodings, decoder_init_state, tgt_sents_padded)
+        if keep_grad:
+            #   for training stage
+            src_encodings, decoder_init_state = self.encode(src_sents_padded)
+            scores,loss = self.decode(src_encodings, decoder_init_state, tgt_sents_padded)
+        else:
+            #   for test stage
+            with torch.no_grad():
+                src_encodings, decoder_init_state = self.encode(src_sents_padded)
+                scores, loss = self.decode(src_encodings, decoder_init_state, tgt_sents_padded)
 
         return loss
 
-    def encode(self, src_sents: List[List[str]]) -> Tuple[Tensor, Any]:
+    def encode(self, src_sents: List[List[str]],keep_grad=True) -> Tuple[Tensor, Any]:
         """
         Use a GRU/LSTM to encode source sentences into hidden states
 
@@ -141,7 +151,7 @@ class NMT(object):
         decoder_init_state=hidden                 #  the decoder's input hidden layer
         return src_encodings, decoder_init_state  # the coding for each state (sent_len,batch_size,1,256), the last hidden_output (1*batch_size*256)
 
-    def decode(self, src_encodings: Tensor, decoder_init_state: Any, tgt_sents: List[List[str]]):
+    def decode(self, src_encodings: Tensor, decoder_init_state: Any, tgt_sents: List[List[str]],keep_grad=True):
         """
         Given source encodings, compute the log-likelihood of predicting the gold-standard target
         sentence tokens
@@ -163,17 +173,21 @@ class NMT(object):
 
         scores=[]
         hidden=decoder_init_state
-        for step in range(0,tgt_sent_len):
+        for step in range(0,tgt_sent_len-1):
+
             x = self.vocab.tgt.words2indices(tgt_sents[step])
+            next_x=self.vocab.tgt.words2indices(tgt_sents[step+1])
 
             #   the batch_size*1 vector (the indices)
             x = torch.from_numpy(np.asarray(x)).type('torch.LongTensor').cuda()
+            next_x = torch.from_numpy(np.asarray(next_x)).type('torch.LongTensor').cuda()
 
             #   batch_size*n_words
             dec_out,hidden=self.decoder.forward(x,hidden,src_encodings)
             scores.append(dec_out.cpu().data.numpy())
 
-            cum_loss+=self.loss(dec_out,x)
+            #   cum loss at all steps
+            cum_loss+=self.loss(dec_out,next_x)
 
 
         scores=np.asarray(scores)
@@ -195,6 +209,95 @@ class NMT(object):
                 score: float: the log-likelihood of the target sentence
         """
 
+        import heapq
+
+        self.decoder.eval()
+        self.encoder.eval()
+
+        hypotheses=[]
+        src_sents=[src_sent]
+        src_sents_padded = utils.input_transpose_max_len(src_sents, pad_token='<pad>', MAX_LEN=MAX_LEN)
+
+        #   run the encoding part for the encoding on the src sentences and the decoder's initial state
+
+        #   src_encodings: 50*1*1*256, (step*1*1*hidden), decoder_init_state: 1*1*256
+        src_encodings, decoder_init_state = self.encode(src_sents_padded)
+
+        #   prev_beams: the whole sentences currently (the initial status should be the index of the <s>)
+        prev_beams=[(0.0,[self.vocab.tgt.word2id['<s>']],decoder_init_state,[0.0])]
+
+        #   a heap to store all the results
+        max_beam_heap=[]
+        for cur_step in range(max_decoding_time_step):
+            #print(cur_step)
+            new_beams=[]
+
+            for prev_beam in prev_beams:
+                #   handle a particular beam
+                #   input the previous status to the decoder
+
+                prev_score=prev_beam[0]
+                prev_sent_words=prev_beam[1][:];prev_hidden=prev_beam[2];prev_scores=prev_beam[3][:]
+                prev_last_word=[prev_sent_words[-1]]
+
+                #   the 1*1 vector (the indices)
+                prev_last_word = torch.from_numpy(np.asarray(prev_last_word)).type('torch.LongTensor').cuda()
+                dec_out, cur_hidden = self.decoder.forward(prev_last_word, prev_hidden, src_encodings)
+
+                #   find top-k in dec_out
+                top_k_val,top_k_ind=torch.topk(dec_out,k=beam_size)
+
+                top_k_val=np.squeeze(top_k_val.detach().cpu().numpy())
+                top_k_ind=np.squeeze(top_k_ind.detach().cpu().numpy())
+
+                for prob_val,prob_ind in zip(top_k_val,top_k_ind):
+
+                    cur_sents_words=prev_sent_words[:]
+                    cur_sents_words.append(prob_ind)
+                    cur_scores=prev_scores[:]
+                    cur_scores.append(prob_val)
+                    cur_score=prev_score+prob_val
+
+                    if prob_ind==self.vocab.tgt.word2id['</s>']:
+                        #   the sentence is ended, normalize the score by length of the sentences
+                        new_beam = (-cur_score/len(cur_sents_words), cur_sents_words, cur_hidden, cur_scores)
+                        heapq.heappush(max_beam_heap,new_beam)
+
+                    else:
+                        #   we should continue grow this beam
+                        new_beam = (cur_score, cur_sents_words, cur_hidden, cur_scores)
+                        new_beams.append(new_beam)
+
+            if len(new_beams)==0:
+                #   there are no new beams rest, break the searching process
+                break
+
+            #   after handling all previous beams, we output the probs
+            new_beams=sorted(new_beams,reverse=True)[0:beam_size]
+            prev_beams=new_beams[:]
+
+        #   push the prev_beams into the heap
+        for cur_beam in prev_beams:
+            cur_score=cur_beam[0];cur_sents_words=cur_beam[1];cur_hidden=cur_beam[2];cur_scores=cur_beam[3]
+            cur_score=-cur_score/len(cur_sents_words)
+            new_beam=(cur_score,cur_sents_words,cur_hidden,cur_scores)
+            heapq.heappush(max_beam_heap,new_beam)
+
+
+        #   finally, we convert the beams into hypotheses
+        for i in range(0,beam_size):
+            cur_beam=heapq.heappop(max_beam_heap)
+            cur_score = -cur_beam[0];cur_sents_ind = cur_beam[1]
+
+            #   convert words to sentences string (add a ending string if necessary)
+            if not cur_sents_ind[-1]==self.vocab.tgt.word2id['</s>']:
+                cur_sents_ind.append(self.vocab.tgt.word2id['</s>'])
+
+            cur_sents_words=self.vocab.tgt.indices2words(cur_sents_ind)
+            cur_hyp=Hypothesis(value=cur_sents_words,score=cur_score)
+            hypotheses.append(cur_hyp)
+
+
         return hypotheses
 
     def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
@@ -209,6 +312,8 @@ class NMT(object):
             ppl: the perplexity on dev sentences
         """
 
+        self.set_model_to_eval()
+
         cum_loss = 0.
         cum_tgt_words = 0.
 
@@ -217,7 +322,9 @@ class NMT(object):
         # e.g., `torch.no_grad()`
 
         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = -model(src_sents, tgt_sents).sum()
+            loss = self.__call__(src_sents, tgt_sents,keep_grad=False)
+
+            loss=loss.detach().cpu().numpy()
 
             cum_loss += loss
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
@@ -225,25 +332,50 @@ class NMT(object):
 
         ppl = np.exp(cum_loss / cum_tgt_words)
 
-        return ppl
+        return cum_loss,ppl
 
-    @staticmethod
-    def load(model_path: str):
+    #   set model to train and test state
+    def set_model_to_train(self):
+        self.encoder.train()
+        self.decoder.train()
+        return
+
+    #   set model to validation
+    def set_model_to_eval(self):
+        self.encoder.eval()
+        self.decoder.eval()
+        return
+
+    def load(self,model_path: str):
         """
         Load a pre-trained model
 
         Returns:
             model: the loaded model
         """
+        encoder_fn = model_path.replace(".bin", "_encoder.pkl")
+        decoder_fn = model_path.replace(".bin", "_decoder.pkl")
 
-        return model
+        self.encoder=utils.load_model_by_state_dict(self.encoder,encoder_fn)
+        self.decoder=utils.load_model_by_state_dict(self.decoder,decoder_fn)
+
+        self.encoder.cuda().eval()
+        self.decoder.cuda().eval()
+
+        return
 
     def save(self, path: str):
         """
         Save current model to file
         """
+        encoder_fn=path.replace(".bin","_encoder.pkl")
+        decoder_fn=path.replace(".bin","_decoder.pkl")
 
-        raise NotImplementedError()
+        utils.save_model_by_state_dict(self.encoder,encoder_fn)
+        utils.save_model_by_state_dict(self.decoder,decoder_fn)
+
+        return
+
 
 
 def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[Hypothesis]) -> float:
@@ -291,6 +423,7 @@ def train(args: Dict[str, str]):
     #   LJ: read the vocabulary
     vocab = pickle.load(open(args['--vocab'], 'rb'))
 
+    #   LJ: set up the loss function (ignore to <pad>)
     nll_loss = nn.NLLLoss(ignore_index=0)
 
     #   LJ: build the model
@@ -298,6 +431,10 @@ def train(args: Dict[str, str]):
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab,loss=nll_loss)
+
+    #   LJ: the learning rate
+    lr = float(args['--lr'])
+
 
     #   LJ: setting some initial losses, etc.
     num_trial = 0
@@ -307,6 +444,9 @@ def train(args: Dict[str, str]):
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
 
+    #   LJ: setup the optimizer
+    optimizer = optim.Adam(list(model.encoder.parameters())+list(model.decoder.parameters()), lr=lr)
+
     while True:
 
         #   start the epoch
@@ -314,19 +454,28 @@ def train(args: Dict[str, str]):
 
         #   LJ: ok, we yield the sentences in a shuffle manner.
         for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
+
+            model.set_model_to_train()
+
             train_iter += 1
 
             #   LJ: current batch size
             batch_size = len(src_sents)
 
             # (batch_size)
-            # LJ: train on the mini-batch and get the loss
+            # LJ: train on the mini-batch and get the loss, backpropagation
+
             #loss = -model(src_sents, tgt_sents)
+            optimizer.zero_grad()
             loss = model(src_sents, tgt_sents)
+            loss.backward()
+            clip_grad_norm(list(model.encoder.parameters())+list(model.decoder.parameters()),clip_grad)
+            optimizer.step()
+
 
             #   add the loss to cumlinative loss
-            report_loss += loss
-            cum_loss += loss
+            report_loss += loss.detach().cpu().numpy()
+            cum_loss += loss.detach().cpu().numpy()
 
             #   LJ: how many targets words are there in all target sentences in current batch
             tgt_words_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
@@ -359,6 +508,7 @@ def train(args: Dict[str, str]):
             # saved best model (and the state of the optimizer), halve the learning rate and continue
             # training. This repeats for up to `--max-num-trial` times.
             if train_iter % valid_niter == 0:
+                model.set_model_to_eval()
                 print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
                                                                                          cum_loss / cumulative_examples,
                                                                                          np.exp(cum_loss / cumulative_tgt_words),
@@ -371,10 +521,12 @@ def train(args: Dict[str, str]):
 
                 # compute dev. ppl and bleu
                 #   LJ: the validation is implemented in a seperate function
-                dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)   # dev batch size can be a bit larger
-                valid_metric = -dev_ppl
+                cum_loss,dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)   # dev batch size can be a bit larger
+                #valid_metric = -dev_ppl
+                valid_metric=-cum_loss
 
-                print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl), file=sys.stderr)
+
+                print('validation: iter %d, dev. ppl %f, val cum loss: %f' % (train_iter, dev_ppl,cum_loss), file=sys.stderr)
 
                 #   LJ: a new better model is found.
                 is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
@@ -403,7 +555,7 @@ def train(args: Dict[str, str]):
                         print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
 
                         # load model
-                        model_save_path
+                        model.load(model_save_path)
 
                         print('restore parameters of the optimizers', file=sys.stderr)
                         # You may also need to load the state of the optimizer saved before
@@ -417,7 +569,7 @@ def train(args: Dict[str, str]):
 
 
 def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_decoding_time_step: int) -> List[List[Hypothesis]]:
-    was_training = model.training
+
 
     hypotheses = []
     for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
@@ -440,7 +592,20 @@ def decode(args: Dict[str, str]):
         test_data_tgt = read_corpus(args['TEST_TARGET_FILE'], source='tgt')
 
     print(f"load model from {args['MODEL_PATH']}", file=sys.stderr)
-    model = NMT.load(args['MODEL_PATH'])
+
+    #   LJ: read the vocabulary
+    vocab = pickle.load(open(args['--vocab'], 'rb'))
+
+    #   LJ: set up the loss function (ignore to <pad>)
+    nll_loss = nn.NLLLoss(ignore_index=0)
+
+    #   LJ: build the model
+    model = NMT(embed_size=int(args['--embed-size']),
+                hidden_size=int(args['--hidden-size']),
+                dropout_rate=float(args['--dropout']),
+                vocab=vocab, loss=nll_loss)
+
+    model.load(args["MODEL_PATH"])
 
     hypotheses = beam_search(model, test_data_src,
                              beam_size=int(args['--beam-size']),

@@ -1,0 +1,3 @@
+python nmt.py train --cuda --vocab "data/vocab.bin" --train-src "data/train.de-en.de.wmixerprep" --train-tgt "data/train.de-en.en.wmixerprep" --dev-src "data/valid.de-en.de" --dev-tgt "data/valid.de-en.en" --save-to "work_dir/model.bin" --valid-niter 2000 --batch-size 48 --hidden-size 256 --embed-size 256 --uniform-init 0.1 --dropout 0.2 --clip-grad 5.0 --lr-decay 0.5
+
+python nmt.py decode --cuda --vocab "data/vocab.bin" --beam-size 5 --embed-size 256 --hidden-size 256 --max-decoding-time-step 100 --dropout 0.2 work_dir/model.bin data/test.de-en.de.wmixerprep data/test.de-en.en.wmixerprep work_dir/decode.txt

@@ -68,6 +68,13 @@ class VocabEntry(object):
         else:
             return [self[w] for w in sents]
 
+    def indices2words(self,sent_ids):
+        ret_words=[]
+        for ind in sent_ids:
+            ret_words.append(self.id2word[ind])
+        return ret_words
+
+
     @staticmethod
     def from_corpus(corpus, size, freq_cutoff=2):
         vocab_entry = VocabEntry()
