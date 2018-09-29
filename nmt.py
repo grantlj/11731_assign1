@@ -229,7 +229,7 @@ class NMT(object):
         #   a heap to store all the results
         max_beam_heap=[]
         for cur_step in range(max_decoding_time_step):
-            #print(cur_step)
+
             new_beams=[]
 
             for prev_beam in prev_beams:
