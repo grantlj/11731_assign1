@@ -67,11 +67,12 @@ Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
 MAX_LEN=100
 
-class NMT(object):
+class NMT(nn.Module):
 
-    def __init__(self, embed_size, hidden_size, vocab, loss, dropout_rate=0.2,decoding_type="ATTENTION",):
+    def __init__(self, embed_size, hidden_size, vocab, loss, dropout_rate=0.2,decoding_type="ATTENTION", bi_direct=True):
         super(NMT, self).__init__()
 
+        self.bi_direct = bi_direct
         self.embed_size = embed_size
         self.hidden_size = hidden_size
         self.dropout_rate = dropout_rate
@@ -81,23 +82,29 @@ class NMT(object):
         self.tgt_vocab_size = len(vocab.tgt.word2id)
         self.src_embed = nn.Embedding(len(vocab.src.word2id), embed_size, padding_idx=0).cuda()
         self.tgt_embed = nn.Embedding(self.tgt_vocab_size, embed_size, padding_idx=0).cuda()
-        self.src_embed.weight.requires_grad = False
-        self.out = nn.Linear(hidden_size, embed_size).cuda()
         self.word_dist = nn.Linear(embed_size, self.tgt_vocab_size).cuda()
-        self.word_dist.weight = self.tgt_embed.weight
 
         self.key_size = 50
-        self.a_key = nn.Linear(hidden_size, self.key_size).cuda()
-        self.q_key = nn.Linear(hidden_size, self.key_size).cuda()
-        self.q_value = nn.Linear(hidden_size, embed_size).cuda()
 
         #if self.decoding_type is "ATTENTION":
         '''
         self.encoder=Encoder(embed_size=embed_size,input_size=len(self.vocab.src),
                                  hidden_size=hidden_size,dropout=dropout_rate,batch_first=True).cuda()
         '''
-        self.encoder = nn.LSTM(embed_size, hidden_size).cuda()
+        self.encoder = nn.LSTM(embed_size, hidden_size, bidirectional=self.bi_direct).cuda()
         self.decoder = nn.LSTM(embed_size * 2, hidden_size).cuda()
+        self.a_key = nn.Linear(hidden_size, self.key_size).cuda()
+        self.out = nn.Linear(hidden_size + embed_size, embed_size).cuda()
+        #self.out = nn.Linear(hidden_size, embed_size).cuda()
+        if self.bi_direct:
+            self.q_key = nn.Linear(hidden_size*2, self.key_size).cuda()
+            self.q_value = nn.Linear(hidden_size*2, embed_size).cuda()
+            self.hidden_transform = nn.Linear(hidden_size * 2, hidden_size).cuda()
+            self.cell_transform = nn.Linear(hidden_size * 2, hidden_size).cuda()
+        else:
+            self.encoder = nn.LSTM(embed_size, hidden_size).cuda()
+            self.q_key = nn.Linear(hidden_size, self.key_size).cuda()
+            self.q_value = nn.Linear(hidden_size, embed_size).cuda()
 
         # initialize neural network layers...
         '''
@@ -107,7 +114,7 @@ class NMT(object):
                                           hidden_size=hidden_size,dropout=dropout_rate,batch_first=True,MAX_LEN=MAX_LEN).cuda()
         '''
 
-    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]],keep_grad=True) -> Tensor:
+    def forward(self, src_sents: List[List[str]], tgt_sents: List[List[str]],keep_grad=True) -> Tensor:
         """
         take a mini-batch of source and target sentences, compute the log-likelihood of 
         target sentences.
@@ -158,7 +165,12 @@ class NMT(object):
         return loss, num_words
 
     def init_hidden(self, hidden):
-        return hidden
+        if self.bi_direct:
+            h = hidden[0].transpose(0, 1).contiguous().view(-1, self.hidden_size * 2).unsqueeze(0)
+            c = hidden[1].transpose(0, 1).contiguous().view(-1, self.hidden_size * 2).unsqueeze(0)
+            return (F.tanh(self.hidden_transform(h)), F.tanh(self.cell_transform(c)))
+        else:
+            return hidden
 
     def encode(self, src_sents: List[List[str]], src_lengths, keep_grad=True) -> Tuple[Tensor, Any]:
         """
@@ -272,7 +284,9 @@ class NMT(object):
         for step in range(tgt_l - 1):
             context = self.attention(decoder_hidden, src_encodings, src_lengths, length)
             decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
-            decoder_outputs[:, step, :] = self.word_dist(self.out(decoder_output.squeeze(1)))
+            decoder_outputs[:, step, :] = self.word_dist(F.tanh(self.out(torch.cat((decoder_output.transpose(0, 1), context), dim=2)))).squeeze(1)
+            #decoder_outputs[:, step, :] = self.word_dist(F.tanh(self.out(decoder_output.transpose(0, 1)))).squeeze(1)
+            #decoder_outputs[:, step, :] = self.word_dist(self.out(decoder_output.transpose(0, 1))).squeeze(1)
             decoder_input = tgt_embed[:, step+1, :].unsqueeze(1)
 
         logits = F.log_softmax(decoder_outputs, dim=2)
@@ -418,7 +432,7 @@ class NMT(object):
         decoder_input = self.tgt_embed(argtop.squeeze(0)).unsqueeze(1)
         src_hidden = src_hidden.expand(beam_size, length, self.hidden_size)
 
-        for t in range(max_decoding_time_step):
+        for t in range(max_decoding_time_step - 1):
             context = self.attention(decoder_hidden, src_hidden, src_lengths, length)
             decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
             decoder_output = self.word_dist(self.out(decoder_output))
@@ -431,25 +445,20 @@ class NMT(object):
             beam[:, :] = beam[last, :]
             beam_eos = beam_eos[last]
             beam_probs = beam_probs[last]
-            pdb.set_trace()
-            beam[:, t+1] = argtop.view(_batch_size, beam_size, top_k)[x][last.data, curr.data] * Variable(~beam_eos[x]).long() + eos_filler * Variable(beam_eos[x]).long()
-            mask = torch.cuda.ByteTensor(_batch_size, beam_size).fill_(0)
-            mask[x] = ~beam_eos[x]
+            beam[:, t+1] = argtop[last, curr] * (~beam_eos).long() + eos_filler * beam_eos.long()
+            mask = ~beam_eos
             beam_probs[mask] = (beam_probs[mask] * (t+1) + best_probs[mask]) / (t+2)
-            decoder_hidden[0][:, x, :, :] = decoder_hidden[0][:, x, :, :][:, last, :]
-            decoder_hidden[1][:, x, :, :] = decoder_hidden[1][:, x, :, :][:, last, :]
+            decoder_hidden = (decoder_hidden[0][:, last, :], decoder_hidden[1][:, last, :])
 
-            beam_eos = beam_eos | (beam[:, :, t+1] == self.eou).data
-            decoder_hidden = (decoder_hidden[0].view(1, _batch_size * beam_size, -1),
-                              decoder_hidden[1].view(1, _batch_size * beam_size, -1))
-            decoder_input = self.embed(beam[:, :, t+1].contiguous().view(-1)).unsqueeze(1)
+            beam_eos = beam_eos | (beam[:, t+1] == self.eou)
+            decoder_input = self.tgt_embed(beam[:, t+1]).unsqueeze(1)
 
             if beam_eos.all():
                 break
 
-        best, best_arg = beam_probs.max(1)
-        generations = beam[torch.arange(_batch_size).long().cuda(), best_arg.data].data.cpu()
-        return generations
+        best, best_arg = beam_probs.max(0)
+        translation = [self.vocab.tgt.id2word[w] for w in beam[best_arg].cpu().tolist()]
+        return [(translation, best.item())]
 
 
     def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
@@ -586,8 +595,8 @@ def train(args: Dict[str, str]):
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab,loss=nll_loss)
-    model.src_embed.weight.data = torch.from_numpy(src_vectors).float().cuda()
-    model.tgt_embed.weight.data = torch.from_numpy(tgt_vectors).float().cuda()
+    #model.src_embed.weight.data = torch.from_numpy(src_vectors).float().cuda()
+    #model.tgt_embed.weight.data = torch.from_numpy(tgt_vectors).float().cuda()
 
     #   LJ: the learning rate
     lr = float(args['--lr'])
@@ -602,7 +611,8 @@ def train(args: Dict[str, str]):
     print('begin Maximum Likelihood training')
 
     #   LJ: setup the optimizer
-    optimizer = optim.Adam(list(model.encoder.parameters())+list(model.decoder.parameters()), lr=lr)
+    #optimizer = optim.Adam(list(model.encoder.parameters())+list(model.decoder.parameters()), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     while True:
 
