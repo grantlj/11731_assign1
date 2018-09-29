@@ -130,6 +130,7 @@ class NMT(object):
             decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
         """
 
+        pdb.set_trace()
         sent_len=len(src_sents);batch_size=len(src_sents[0])
 
         #   iterate through the step-th words in all sentences
