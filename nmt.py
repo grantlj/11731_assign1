@@ -52,6 +52,7 @@ import utils
 from utils import read_corpus, batch_iter
 from vocab import Vocab, VocabEntry
 import torch
+import pdb
 from torch import Tensor
 from nn_modules import Encoder,AttentionDecoder
 from torch import nn
@@ -75,6 +76,8 @@ class NMT(object):
         self.vocab = vocab
         self.decoding_type=decoding_type
         self.loss=loss
+        self.src_embed = nn.Embedding(len(vocab.src.word2id), embed_size, padding_idx=0)
+        self.tgt_embed = nn.Embedding(len(vocab.tgt.word2id), embed_size, padding_idx=0)
 
         #if self.decoding_type is "ATTENTION":
         self.encoder=Encoder(embed_size=embed_size,input_size=len(self.vocab.src),
