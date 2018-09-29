@@ -52,9 +52,11 @@ import utils
 from utils import read_corpus, batch_iter
 from vocab import Vocab, VocabEntry
 import torch
+import torch.nn.functional as F
 import pdb
 from torch import Tensor
 from nn_modules import Encoder,AttentionDecoder
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch import nn
 from torch.autograd import Variable
 from torch import optim
@@ -76,18 +78,34 @@ class NMT(object):
         self.vocab = vocab
         self.decoding_type=decoding_type
         self.loss=loss
-        self.src_embed = nn.Embedding(len(vocab.src.word2id), embed_size, padding_idx=0)
-        self.tgt_embed = nn.Embedding(len(vocab.tgt.word2id), embed_size, padding_idx=0)
+        self.tgt_vocab_size = len(vocab.tgt.word2id)
+        self.src_embed = nn.Embedding(len(vocab.src.word2id), embed_size, padding_idx=0).cuda()
+        self.tgt_embed = nn.Embedding(self.tgt_vocab_size, embed_size, padding_idx=0).cuda()
+        self.src_embed.weight.requires_grad = False
+        self.out = nn.Linear(hidden_size, embed_size).cuda()
+        self.word_dist = nn.Linear(embed_size, self.tgt_vocab_size).cuda()
+        self.word_dist.weight = self.tgt_embed.weight
+
+        self.key_size = 50
+        self.a_key = nn.Linear(hidden_size, self.key_size).cuda()
+        self.q_key = nn.Linear(hidden_size, self.key_size).cuda()
+        self.q_value = nn.Linear(hidden_size, embed_size).cuda()
 
         #if self.decoding_type is "ATTENTION":
+        '''
         self.encoder=Encoder(embed_size=embed_size,input_size=len(self.vocab.src),
                                  hidden_size=hidden_size,dropout=dropout_rate,batch_first=True).cuda()
+        '''
+        self.encoder = nn.LSTM(embed_size, hidden_size).cuda()
+        self.decoder = nn.LSTM(embed_size * 2, hidden_size).cuda()
 
         # initialize neural network layers...
+        '''
         if decoding_type=="ATTENTION":
             self.decoder=AttentionDecoder(embed_size=embed_size,
                                           output_size=len(self.vocab.tgt),
                                           hidden_size=hidden_size,dropout=dropout_rate,batch_first=True,MAX_LEN=MAX_LEN).cuda()
+        '''
 
     def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]],keep_grad=True) -> Tensor:
         """
@@ -105,22 +123,44 @@ class NMT(object):
         """
 
         #   in the first place, let us padding the original inputs to fixed length (MAX_TOKEN_LEN*BATCH_SIZE)
+        '''
         src_sents_padded=utils.input_transpose_max_len(src_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
         tgt_sents_padded=utils.input_transpose_max_len(tgt_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
+        '''
+        pairs = list(zip(src_sents, tgt_sents))
+        pairs.sort(key=lambda x: len(x[0]), reverse=True)
+        src_sents, tgt_sents = zip(*pairs)
+        src_lengths = [len(s) for s in src_sents]
+        tgt_lengths = [len(s) for s in tgt_sents]
+        src_max_len = max(src_lengths)
+        tgt_max_len = max(tgt_lengths)
+        batch_size = len(src_sents)
+        src_ind = torch.zeros(batch_size, src_max_len).long()
+        tgt_ind = torch.zeros(batch_size, tgt_max_len).long()
+        for x in range(len(src_sents)):
+            src_ind[x, :len(src_sents[x])] = torch.LongTensor(self.vocab.src.words2indices(src_sents[x]))
+            tgt_ind[x, :len(tgt_sents[x])] = torch.LongTensor(self.vocab.tgt.words2indices(tgt_sents[x]))
+        src_ind = src_ind.cuda()
+        tgt_ind = tgt_ind.cuda()
 
         if keep_grad:
             #   for training stage
-            src_encodings, decoder_init_state = self.encode(src_sents_padded)
-            scores,loss = self.decode(src_encodings, decoder_init_state, tgt_sents_padded)
+            #src_encodings, decoder_init_state = self.encode(src_sents_padded)
+            src_encodings, decoder_init_state = self.encode(src_ind, src_lengths)
+            loss, num_words = self.decode(src_encodings, src_lengths, decoder_init_state, tgt_ind, tgt_lengths)
         else:
             #   for test stage
             with torch.no_grad():
-                src_encodings, decoder_init_state = self.encode(src_sents_padded)
-                scores, loss = self.decode(src_encodings, decoder_init_state, tgt_sents_padded)
+                #src_encodings, decoder_init_state = self.encode(src_sents_padded)
+                src_encodings, decoder_init_state = self.encode(src_ind, src_lengths)
+                loss, num_words = self.decode(src_encodings, src_lengths, decoder_init_state, tgt_ind, tgt_lengths)
 
-        return loss
+        return loss, num_words
 
-    def encode(self, src_sents: List[List[str]],keep_grad=True) -> Tuple[Tensor, Any]:
+    def init_hidden(self, hidden):
+        return hidden
+
+    def encode(self, src_sents: List[List[str]], src_lengths, keep_grad=True) -> Tuple[Tensor, Any]:
         """
         Use a GRU/LSTM to encode source sentences into hidden states
 
@@ -133,6 +173,7 @@ class NMT(object):
             decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
         """
 
+        '''
         sent_len=len(src_sents);batch_size=len(src_sents[0])
 
         #   iterate through the step-th words in all sentences
@@ -153,8 +194,31 @@ class NMT(object):
 
         decoder_init_state=hidden                 #  the decoder's input hidden layer
         return src_encodings, decoder_init_state  # the coding for each state (sent_len,batch_size,1,256), the last hidden_output (1*batch_size*256)
+        '''
+        src_embed = self.src_embed(src_sents)
+        packed_input = pack_padded_sequence(src_embed, np.asarray(src_lengths), batch_first=True)
+        src_output, src_last_hidden = self.encoder(packed_input)
+        src_hidden, _ = pad_packed_sequence(src_output, batch_first=True)
+        decoder_hidden = self.init_hidden(src_last_hidden) 
 
-    def decode(self, src_encodings: Tensor, decoder_init_state: Any, tgt_sents: List[List[str]],keep_grad=True):
+        return src_hidden, decoder_hidden
+        
+    def attention(self, decoder_hidden, src_hidden, src_lengths, length):
+        a_key = self.a_key(decoder_hidden[0].squeeze(0))
+
+        q_key = self.q_key(src_hidden)
+        q_value = self.q_value(src_hidden)
+        q_energy = torch.bmm(q_key, a_key.unsqueeze(2)).squeeze(2)
+        q_mask  = torch.arange(length).long().cuda().repeat(src_hidden.size(0), 1) < torch.cuda.LongTensor(src_lengths).repeat(length, 1).transpose(0, 1)
+        q_energy[~q_mask] = -np.inf
+        q_weights = F.softmax(q_energy, dim=1).unsqueeze(1)
+        #q_weights = F.sigmoid(q_energy).unsqueeze(1)
+        q_context = torch.bmm(q_weights, q_value)
+
+        return q_context
+
+
+    def decode(self, src_encodings: Tensor, src_lengths, decoder_init_state: Any, tgt_sents: List[List[str]], tgt_lengths, keep_grad=True):
         """
         Given source encodings, compute the log-likelihood of predicting the gold-standard target
         sentence tokens
@@ -170,6 +234,7 @@ class NMT(object):
                 each example in the input batch
         """
 
+        '''
         cum_loss=0
 
         tgt_sent_len=len(tgt_sents);batch_size=len(tgt_sents[0])
@@ -195,9 +260,28 @@ class NMT(object):
 
         scores=np.asarray(scores)
         return scores,cum_loss
+        '''
+        batch_size = src_encodings.size(0)
+        length = src_encodings.size(1)
+        tgt_embed = self.tgt_embed(tgt_sents)
+        tgt_l = tgt_embed.size(1)
+
+        decoder_input = tgt_embed[:, 0, :].unsqueeze(1)
+        decoder_outputs = torch.cuda.FloatTensor(batch_size, tgt_l - 1, self.tgt_vocab_size)
+        decoder_hidden = decoder_init_state
+        for step in range(tgt_l - 1):
+            context = self.attention(decoder_hidden, src_encodings, src_lengths, length)
+            decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
+            decoder_outputs[:, step, :] = self.word_dist(self.out(decoder_output.squeeze(1)))
+            decoder_input = tgt_embed[:, step+1, :].unsqueeze(1)
+
+        logits = F.log_softmax(decoder_outputs, dim=2)
+        logits = logits.contiguous().view(-1, self.tgt_vocab_size)
+        loss = self.loss(logits, tgt_sents[:, 1:].contiguous().view(-1))
+        return loss, (tgt_sents[:, 1:] != 0).sum().item()
 
 
-    def beam_search(self, src_sent: List[str], beam_size: int=5, max_decoding_time_step: int=70) -> List[Hypothesis]:
+    def beam_search(self, src_sent: List[str], beam_size: int=20, max_decoding_time_step: int=70) -> List[Hypothesis]:
         """
         Given a single source sentence, perform beam search
 
@@ -212,11 +296,10 @@ class NMT(object):
                 score: float: the log-likelihood of the target sentence
         """
 
-        import heapq
-
         self.decoder.eval()
         self.encoder.eval()
 
+        '''
         hypotheses=[]
         src_sents=[src_sent]
         src_sents_padded = utils.input_transpose_max_len(src_sents, pad_token='<pad>', MAX_LEN=MAX_LEN)
@@ -302,6 +385,72 @@ class NMT(object):
 
 
         return hypotheses
+        '''
+
+        self.eou = 2
+        top_k = 15
+        src_ind = torch.cuda.LongTensor(self.vocab.src.words2indices(src_sent))
+        src_embed = self.src_embed(src_ind).unsqueeze(0)
+        src_lengths = np.asarray([len(src_sent)])
+        packed_input = pack_padded_sequence(src_embed, src_lengths, batch_first=True)
+        src_output, src_last_hidden = self.encoder(packed_input)
+        src_hidden, _ = pad_packed_sequence(src_output, batch_first=True)
+        decoder_hidden = self.init_hidden(src_last_hidden) 
+
+        batch_size = src_embed.size(0)
+        assert batch_size == 1 
+        eos_filler = torch.zeros(beam_size).long().cuda().fill_(self.eou)
+        decoder_input = self.tgt_embed(torch.cuda.LongTensor([1])).unsqueeze(1)
+        length = src_hidden.size(1)
+
+        context = self.attention(decoder_hidden, src_hidden, src_lengths, length)
+        decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2), decoder_hidden)
+        decoder_output = self.word_dist(self.out(decoder_output.squeeze(1)))
+        decoder_output[:, 0] = -np.inf
+
+        logprobs, argtop = torch.topk(F.log_softmax(decoder_output, dim=1), beam_size, dim=1)
+        beam = torch.zeros(beam_size, max_decoding_time_step).long().cuda()
+        beam[:, 0] = argtop
+        beam_probs = logprobs.clone().squeeze(0)
+        beam_eos = argtop.squeeze(0) == self.eou
+        decoder_hidden = (decoder_hidden[0].expand(1, beam_size, self.hidden_size).contiguous(),
+                          decoder_hidden[1].expand(1, beam_size, self.hidden_size).contiguous())
+        decoder_input = self.tgt_embed(argtop.squeeze(0)).unsqueeze(1)
+        src_hidden = src_hidden.expand(beam_size, length, self.hidden_size)
+
+        for t in range(max_decoding_time_step):
+            context = self.attention(decoder_hidden, src_hidden, src_lengths, length)
+            decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
+            decoder_output = self.word_dist(self.out(decoder_output))
+
+            logprobs, argtop = torch.topk(F.log_softmax(decoder_output.squeeze(0), dim=1), top_k, dim=1)
+            best_probs, best_args = (beam_probs.expand(top_k, beam_size).transpose(0, 1) + logprobs).view(-1).topk(beam_size)
+
+            last = best_args / top_k
+            curr = best_args % top_k
+            beam[:, :] = beam[last, :]
+            beam_eos = beam_eos[last]
+            beam_probs = beam_probs[last]
+            pdb.set_trace()
+            beam[:, t+1] = argtop.view(_batch_size, beam_size, top_k)[x][last.data, curr.data] * Variable(~beam_eos[x]).long() + eos_filler * Variable(beam_eos[x]).long()
+            mask = torch.cuda.ByteTensor(_batch_size, beam_size).fill_(0)
+            mask[x] = ~beam_eos[x]
+            beam_probs[mask] = (beam_probs[mask] * (t+1) + best_probs[mask]) / (t+2)
+            decoder_hidden[0][:, x, :, :] = decoder_hidden[0][:, x, :, :][:, last, :]
+            decoder_hidden[1][:, x, :, :] = decoder_hidden[1][:, x, :, :][:, last, :]
+
+            beam_eos = beam_eos | (beam[:, :, t+1] == self.eou).data
+            decoder_hidden = (decoder_hidden[0].view(1, _batch_size * beam_size, -1),
+                              decoder_hidden[1].view(1, _batch_size * beam_size, -1))
+            decoder_input = self.embed(beam[:, :, t+1].contiguous().view(-1)).unsqueeze(1)
+
+            if beam_eos.all():
+                break
+
+        best, best_arg = beam_probs.max(1)
+        generations = beam[torch.arange(_batch_size).long().cuda(), best_arg.data].data.cpu()
+        return generations
+
 
     def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
         """
@@ -325,11 +474,11 @@ class NMT(object):
         # e.g., `torch.no_grad()`
 
         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = self.__call__(src_sents, tgt_sents,keep_grad=False)
+            loss, num_words = self.__call__(src_sents, tgt_sents,keep_grad=False)
 
             loss=loss.detach().cpu().numpy()
 
-            cum_loss += loss
+            cum_loss += loss * num_words
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
             cum_tgt_words += tgt_word_num_to_predict
 
@@ -429,11 +578,16 @@ def train(args: Dict[str, str]):
     #   LJ: set up the loss function (ignore to <pad>)
     nll_loss = nn.NLLLoss(ignore_index=0)
 
+    src_vectors = np.load('word_embedding/de.npz')['embedding']
+    tgt_vectors = np.load('word_embedding/en.npz')['embedding']
+
     #   LJ: build the model
     model = NMT(embed_size=int(args['--embed-size']),
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab,loss=nll_loss)
+    model.src_embed.weight.data = torch.from_numpy(src_vectors).float().cuda()
+    model.tgt_embed.weight.data = torch.from_numpy(tgt_vectors).float().cuda()
 
     #   LJ: the learning rate
     lr = float(args['--lr'])
@@ -470,15 +624,15 @@ def train(args: Dict[str, str]):
 
             #loss = -model(src_sents, tgt_sents)
             optimizer.zero_grad()
-            loss = model(src_sents, tgt_sents)
+            loss, num_words = model(src_sents, tgt_sents)
             loss.backward()
             clip_grad_norm(list(model.encoder.parameters())+list(model.decoder.parameters()),clip_grad)
             optimizer.step()
 
 
             #   add the loss to cumlinative loss
-            report_loss += loss.detach().cpu().numpy()
-            cum_loss += loss.detach().cpu().numpy()
+            report_loss += loss.detach().cpu().numpy() * num_words
+            cum_loss += loss.detach().cpu().numpy() * num_words
 
             #   LJ: how many targets words are there in all target sentences in current batch
             tgt_words_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
