@@ -33,6 +33,8 @@ Options:
     --valid-niter=<int>                     perform validation after how many iterations [default: 2000]
     --dropout=<float>                       dropout [default: 0.2]
     --max-decoding-time-step=<int>          maximum number of decoding time steps [default: 70]
+    --local                                 local attention
+    --conv                                  convolutional layer between word embedding and rnn
 """
 
 import math
@@ -69,10 +71,14 @@ MAX_LEN=100
 
 class NMT(nn.Module):
 
-    def __init__(self, embed_size, hidden_size, vocab, loss, dropout_rate=0.2,decoding_type="ATTENTION", bi_direct=True):
+    def __init__(self, embed_size, hidden_size, vocab, loss, 
+                 dropout_rate=0.2,decoding_type="ATTENTION", 
+                 bi_direct=True, local_att=False, conv=False):
         super(NMT, self).__init__()
 
         self.bi_direct = bi_direct
+        self.conv = conv
+        self.local_att = local_att
         self.embed_size = embed_size
         self.hidden_size = hidden_size
         self.dropout_rate = dropout_rate
@@ -84,6 +90,8 @@ class NMT(nn.Module):
         self.tgt_embed = nn.Embedding(self.tgt_vocab_size, embed_size, padding_idx=0).cuda()
         self.word_dist = nn.Linear(embed_size, self.tgt_vocab_size).cuda()
 
+        self.cpu_time = 0
+
         self.key_size = 50
 
         #if self.decoding_type is "ATTENTION":
@@ -91,8 +99,8 @@ class NMT(nn.Module):
         self.encoder=Encoder(embed_size=embed_size,input_size=len(self.vocab.src),
                                  hidden_size=hidden_size,dropout=dropout_rate,batch_first=True).cuda()
         '''
-        self.encoder = nn.LSTM(embed_size, hidden_size, bidirectional=self.bi_direct).cuda()
-        self.decoder = nn.LSTM(embed_size * 2, hidden_size).cuda()
+        self.encoder = nn.LSTM(embed_size, hidden_size, bidirectional=self.bi_direct, dropout=dropout_rate).cuda()
+        self.decoder = nn.LSTM(embed_size * 2, hidden_size, dropout=dropout_rate).cuda()
         self.a_key = nn.Linear(hidden_size, self.key_size).cuda()
         self.out = nn.Linear(hidden_size + embed_size, embed_size).cuda()
         #self.out = nn.Linear(hidden_size, embed_size).cuda()
@@ -106,6 +114,13 @@ class NMT(nn.Module):
             self.q_key = nn.Linear(hidden_size, self.key_size).cuda()
             self.q_value = nn.Linear(hidden_size, embed_size).cuda()
 
+        if local_att:
+            self.l_key = nn.Linear(hidden_size, self.key_size).cuda()
+            self.v_key = nn.Linear(self.key_size, 1).cuda()
+
+        if self.conv:
+            self.conv1d = nn.Conv1d(embed_size, embed_size, 3, padding=1).cuda()
+            self.conv1d2 = nn.Conv1d(embed_size, embed_size, 3, padding=1).cuda()
         # initialize neural network layers...
         '''
         if decoding_type=="ATTENTION":
@@ -134,6 +149,7 @@ class NMT(nn.Module):
         src_sents_padded=utils.input_transpose_max_len(src_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
         tgt_sents_padded=utils.input_transpose_max_len(tgt_sents,pad_token='<pad>',MAX_LEN=MAX_LEN)
         '''
+        _time = time.clock()
         pairs = list(zip(src_sents, tgt_sents))
         pairs.sort(key=lambda x: len(x[0]), reverse=True)
         src_sents, tgt_sents = zip(*pairs)
@@ -149,6 +165,7 @@ class NMT(nn.Module):
             tgt_ind[x, :len(tgt_sents[x])] = torch.LongTensor(self.vocab.tgt.words2indices(tgt_sents[x]))
         src_ind = src_ind.cuda()
         tgt_ind = tgt_ind.cuda()
+        self.cpu_time += time.clock() - _time
 
         if keep_grad:
             #   for training stage
@@ -208,6 +225,9 @@ class NMT(nn.Module):
         return src_encodings, decoder_init_state  # the coding for each state (sent_len,batch_size,1,256), the last hidden_output (1*batch_size*256)
         '''
         src_embed = self.src_embed(src_sents)
+        if self.conv:
+            src_embed = F.relu(self.conv1d(src_embed.transpose(1, 2)))
+            src_embed = self.conv1d2(src_embed).transpose(1, 2)
         packed_input = pack_padded_sequence(src_embed, np.asarray(src_lengths), batch_first=True)
         src_output, src_last_hidden = self.encoder(packed_input)
         src_hidden, _ = pad_packed_sequence(src_output, batch_first=True)
@@ -215,15 +235,16 @@ class NMT(nn.Module):
 
         return src_hidden, decoder_hidden
         
-    def attention(self, decoder_hidden, src_hidden, src_lengths, length):
+    def attention(self, decoder_hidden, q_key, q_value, q_mask, center=None):
         a_key = self.a_key(decoder_hidden[0].squeeze(0))
 
-        q_key = self.q_key(src_hidden)
-        q_value = self.q_value(src_hidden)
         q_energy = torch.bmm(q_key, a_key.unsqueeze(2)).squeeze(2)
-        q_mask  = torch.arange(length).long().cuda().repeat(src_hidden.size(0), 1) < torch.cuda.LongTensor(src_lengths).repeat(length, 1).transpose(0, 1)
         q_energy[~q_mask] = -np.inf
         q_weights = F.softmax(q_energy, dim=1).unsqueeze(1)
+        if center is not None:
+            indices = torch.arange(q_mask.size(1)).expand(q_mask.size(0), q_mask.size(1)).cuda()
+            align_w = torch.exp(-(indices - center.unsqueeze(1)) ** 2 / 32) # D = 8
+            q_weights = q_weights * align_w.unsqueeze(1)
         #q_weights = F.sigmoid(q_energy).unsqueeze(1)
         q_context = torch.bmm(q_weights, q_value)
 
@@ -279,17 +300,28 @@ class NMT(nn.Module):
         tgt_l = tgt_embed.size(1)
 
         decoder_input = tgt_embed[:, 0, :].unsqueeze(1)
-        decoder_outputs = torch.cuda.FloatTensor(batch_size, tgt_l - 1, self.tgt_vocab_size)
+        decoder_outputs = torch.cuda.FloatTensor(batch_size, tgt_l - 1, self.hidden_size + self.embed_size)
         decoder_hidden = decoder_init_state
+        q_key = self.q_key(src_encodings)
+        q_value = self.q_value(src_encodings)
+        q_mask  = torch.arange(length).long().cuda().repeat(src_encodings.size(0), 1) < torch.cuda.LongTensor(src_lengths).repeat(length, 1).transpose(0, 1)
+        src_lengths = torch.cuda.LongTensor(src_lengths)
         for step in range(tgt_l - 1):
-            context = self.attention(decoder_hidden, src_encodings, src_lengths, length)
+            if self.local_att:
+                align = F.sigmoid(self.v_key(F.tanh(self.l_key(decoder_hidden[0].squeeze(0))))).squeeze(1)
+                center = src_lengths.float() * align
+                context = self.attention(decoder_hidden, q_key, q_value, q_mask, center=center)
+            else:
+                context = self.attention(decoder_hidden, q_key, q_value, q_mask)
             decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
-            decoder_outputs[:, step, :] = self.word_dist(F.tanh(self.out(torch.cat((decoder_output.transpose(0, 1), context), dim=2)))).squeeze(1)
+            #decoder_outputs[:, step, :] = self.word_dist(F.tanh(self.out(torch.cat((decoder_output.transpose(0, 1), context), dim=2)))).squeeze(1)
             #decoder_outputs[:, step, :] = self.word_dist(F.tanh(self.out(decoder_output.transpose(0, 1)))).squeeze(1)
             #decoder_outputs[:, step, :] = self.word_dist(self.out(decoder_output.transpose(0, 1))).squeeze(1)
+            decoder_outputs[:, step, :] = torch.cat((decoder_output.transpose(0, 1), context), dim=2).squeeze(1)
             decoder_input = tgt_embed[:, step+1, :].unsqueeze(1)
-
-        logits = F.log_softmax(decoder_outputs, dim=2)
+        
+        logits = self.word_dist(F.tanh(self.out(decoder_outputs)))
+        logits = F.log_softmax(logits, dim=2)
         logits = logits.contiguous().view(-1, self.tgt_vocab_size)
         loss = self.loss(logits, tgt_sents[:, 1:].contiguous().view(-1))
         return loss, (tgt_sents[:, 1:] != 0).sum().item()
@@ -402,9 +434,12 @@ class NMT(nn.Module):
         '''
 
         self.eou = 2
-        top_k = 15
+        top_k = 10
         src_ind = torch.cuda.LongTensor(self.vocab.src.words2indices(src_sent))
         src_embed = self.src_embed(src_ind).unsqueeze(0)
+        if self.conv:
+            src_embed = F.relu(self.conv1d(src_embed.transpose(1, 2)))
+            src_embed = self.conv1d2(src_embed).transpose(1, 2)
         src_lengths = np.asarray([len(src_sent)])
         packed_input = pack_padded_sequence(src_embed, src_lengths, batch_first=True)
         src_output, src_last_hidden = self.encoder(packed_input)
@@ -416,10 +451,20 @@ class NMT(nn.Module):
         eos_filler = torch.zeros(beam_size).long().cuda().fill_(self.eou)
         decoder_input = self.tgt_embed(torch.cuda.LongTensor([1])).unsqueeze(1)
         length = src_hidden.size(1)
+        src_lengths = torch.cuda.LongTensor(src_lengths)
 
-        context = self.attention(decoder_hidden, src_hidden, src_lengths, length)
+        q_key = self.q_key(src_hidden)
+        q_value = self.q_value(src_hidden)
+        q_mask  = torch.arange(length).long().cuda().repeat(src_hidden.size(0), 1) < torch.cuda.LongTensor(src_lengths).repeat(length, 1).transpose(0, 1)
+        if self.local_att:
+            align = F.sigmoid(self.v_key(F.tanh(self.l_key(decoder_hidden[0].squeeze(0))))).squeeze(1)
+            center = src_lengths.float() * align
+            context = self.attention(decoder_hidden, q_key, q_value, q_mask, center=center)
+        else:
+            context = self.attention(decoder_hidden, q_key, q_value, q_mask)
         decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2), decoder_hidden)
-        decoder_output = self.word_dist(self.out(decoder_output.squeeze(1)))
+        decoder_output = torch.cat((decoder_output, context), dim=2)
+        decoder_output = self.word_dist(F.tanh(self.out(decoder_output.squeeze(1))))
         decoder_output[:, 0] = -np.inf
 
         logprobs, argtop = torch.topk(F.log_softmax(decoder_output, dim=1), beam_size, dim=1)
@@ -430,14 +475,23 @@ class NMT(nn.Module):
         decoder_hidden = (decoder_hidden[0].expand(1, beam_size, self.hidden_size).contiguous(),
                           decoder_hidden[1].expand(1, beam_size, self.hidden_size).contiguous())
         decoder_input = self.tgt_embed(argtop.squeeze(0)).unsqueeze(1)
-        src_hidden = src_hidden.expand(beam_size, length, self.hidden_size)
+        src_hidden = src_hidden.expand(beam_size, length, self.hidden_size * (int(self.bi_direct) + 1))
+        q_key = self.q_key(src_hidden)
+        q_value = self.q_value(src_hidden)
+        q_mask  = torch.arange(length).long().cuda().repeat(src_hidden.size(0), 1) < torch.cuda.LongTensor(src_lengths).repeat(length, 1).transpose(0, 1)
 
         for t in range(max_decoding_time_step - 1):
-            context = self.attention(decoder_hidden, src_hidden, src_lengths, length)
+            if self.local_att:
+                align = F.sigmoid(self.v_key(F.tanh(self.l_key(decoder_hidden[0].squeeze(0))))).squeeze(1)
+                center = src_lengths.float() * align
+                context = self.attention(decoder_hidden, q_key, q_value, q_mask, center=center)
+            else:
+                context = self.attention(decoder_hidden, q_key, q_value, q_mask)
             decoder_output, decoder_hidden = self.decoder(torch.cat((decoder_input, context), dim=2).transpose(0, 1), decoder_hidden)
-            decoder_output = self.word_dist(self.out(decoder_output))
+            decoder_output = torch.cat((decoder_output.transpose(0, 1), context), dim=2)
+            decoder_output = self.word_dist(F.tanh(self.out(decoder_output)))
 
-            logprobs, argtop = torch.topk(F.log_softmax(decoder_output.squeeze(0), dim=1), top_k, dim=1)
+            logprobs, argtop = torch.topk(F.log_softmax(decoder_output.squeeze(1), dim=1), top_k, dim=1)
             best_probs, best_args = (beam_probs.expand(top_k, beam_size).transpose(0, 1) + logprobs).view(-1).topk(beam_size)
 
             last = best_args / top_k
@@ -457,8 +511,11 @@ class NMT(nn.Module):
                 break
 
         best, best_arg = beam_probs.max(0)
-        translation = [self.vocab.tgt.id2word[w] for w in beam[best_arg].cpu().tolist()]
-        return [(translation, best.item())]
+        translation = beam[best_arg].cpu().tolist()
+        if self.eou in translation:
+            translation = translation[:translation.index(self.eou)]
+        translation = [self.vocab.tgt.id2word[w] for w in translation]
+        return [Hypothesis(value=translation, score=best.item())]
 
 
     def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
@@ -529,11 +586,14 @@ class NMT(nn.Module):
         """
         Save current model to file
         """
+        '''
         encoder_fn=path.replace(".bin","_encoder.pkl")
         decoder_fn=path.replace(".bin","_decoder.pkl")
 
         utils.save_model_by_state_dict(self.encoder,encoder_fn)
         utils.save_model_by_state_dict(self.decoder,decoder_fn)
+        '''
+        utils.save_model_by_state_dict(self, path)
 
         return
 
@@ -594,9 +654,15 @@ def train(args: Dict[str, str]):
     model = NMT(embed_size=int(args['--embed-size']),
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
-                vocab=vocab,loss=nll_loss)
-    #model.src_embed.weight.data = torch.from_numpy(src_vectors).float().cuda()
-    #model.tgt_embed.weight.data = torch.from_numpy(tgt_vectors).float().cuda()
+                local_att=bool(args['--local']),
+                conv=bool(args['--conv']),
+                vocab=vocab,
+                loss=nll_loss)
+    bound = float(args['--uniform-init'])
+    for p in model.parameters():
+        torch.nn.init.uniform_(p.data, a=-bound, b=bound)
+    model.src_embed.weight.data = torch.from_numpy(src_vectors).float().cuda()
+    model.tgt_embed.weight.data = torch.from_numpy(tgt_vectors).float().cuda()
 
     #   LJ: the learning rate
     lr = float(args['--lr'])
@@ -612,7 +678,7 @@ def train(args: Dict[str, str]):
 
     #   LJ: setup the optimizer
     #optimizer = optim.Adam(list(model.encoder.parameters())+list(model.decoder.parameters()), lr=lr)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=lr)
 
     while True:
 
@@ -719,10 +785,12 @@ def train(args: Dict[str, str]):
 
                         # decay learning rate, and restore from previously best checkpoint
                         lr = lr * float(args['--lr-decay'])
+                        optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=lr)
                         print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
 
                         # load model
-                        model.load(model_save_path)
+                        #model.load(model_save_path)
+                        model = utils.load_model_by_state_dict(model, model_save_path)
 
                         print('restore parameters of the optimizers', file=sys.stderr)
                         # You may also need to load the state of the optimizer saved before
@@ -770,9 +838,15 @@ def decode(args: Dict[str, str]):
     model = NMT(embed_size=int(args['--embed-size']),
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
-                vocab=vocab, loss=nll_loss)
+                local_att=bool(args['--local']),
+                conv=bool(args['--conv']),
+                vocab=vocab, 
+                loss=nll_loss)
 
+    '''
     model.load(args["MODEL_PATH"])
+    '''
+    model = utils.load_model_by_state_dict(model, args['MODEL_PATH'])
 
     hypotheses = beam_search(model, test_data_src,
                              beam_size=int(args['--beam-size']),
